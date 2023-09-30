@@ -1,0 +1,11 @@
+[package]
+name = "tb2umap"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+shalrath = "0.2.5"
+glam = "0.23"
+unreal_asset = { git = "https://github.com/astrotechies/unrealmodding", rev = "40bc421" }
