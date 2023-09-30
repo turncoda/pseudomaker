@@ -19,13 +19,15 @@ const UNIT_Z: Vec3 = Vec3::new(0.0, 0.0, 1.0);
 struct UBox {
     position: DVec3,
     scale: DVec3,
+    euler: DVec3,
 }
 
 impl UBox {
-    fn new(p: DVec3, s: DVec3) -> UBox {
+    fn new(p: DVec3, s: DVec3, r: DVec3) -> UBox {
         UBox {
             position: p,
             scale: s,
+            euler: r,
         }
     }
 }
@@ -44,11 +46,10 @@ fn main() {
     let mut uboxes = vec![];
     for entity in map_ast.0 {
         for brush in entity.brushes.0 {
-            dbg!(derive_rotation(&brush));
             let mut centroid = DVec3::new(0.0, 0.0, 0.0);
             let mut min = DVec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
             let mut max = DVec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-            for brush_plane in brush.0 {
+            for brush_plane in &brush.0 {
                 let x = brush_plane.plane.v0.x as f64;
                 let y = -brush_plane.plane.v0.y as f64;
                 let z = brush_plane.plane.v0.z as f64;
@@ -62,7 +63,8 @@ fn main() {
                 max.y = f64::max(y, max.y);
                 max.z = f64::max(z, max.z);
             }
-            uboxes.push(UBox::new(centroid / 6.0, max - min));
+            let euler = derive_rotation(&brush) / PI * 180.0;
+            uboxes.push(UBox::new(centroid / 6.0, max - min, DVec3::new(0.0, 0.0, 0.0)));
         }
     }
 
@@ -76,18 +78,7 @@ fn main2(uboxes: Vec<UBox>, output_path: &str) {
     let mut asset = Asset::new(data_file, Some(bulk_file), EngineVersion::VER_UE5_1, None).unwrap();
 
     for ubox in uboxes {
-        add_box(&mut asset, ubox.position, ubox.scale);
-    }
-
-    {
-        // TODO put this in /Game/Mods/PseudoMaker
-        let new_mesh_import_path = asset.add_fname("/Game/coolstuff/u1_cube");
-        let mesh_import = &mut asset.imports[11];
-        assert_eq!(
-            mesh_import.object_name.get_owned_content(),
-            "/Game/Maps/u1_cube"
-        );
-        mesh_import.object_name = new_mesh_import_path;
+        add_box(&mut asset, ubox.position, ubox.scale, ubox.euler);
     }
 
     {
@@ -119,7 +110,7 @@ fn main2(uboxes: Vec<UBox>, output_path: &str) {
     let _ = asset.write_data(&mut out_uasset, Some(&mut out_uexp));
 }
 
-fn add_box(asset: &mut Asset<std::io::BufReader<File>>, pos: DVec3, scale: DVec3) {
+fn add_box(asset: &mut Asset<std::io::BufReader<File>>, pos: DVec3, scale: DVec3, euler: DVec3) {
     let mut exp1 = asset.get_export(PackageIndex::new(4)).unwrap().clone();
     let exp2 = asset.get_export(PackageIndex::new(5)).unwrap().clone();
     asset.asset_data.exports.push(exp2);
@@ -140,6 +131,7 @@ fn add_box(asset: &mut Asset<std::io::BufReader<File>>, pos: DVec3, scale: DVec3
     exp2.get_base_export_mut().create_before_create_dependencies[0] = idx1;
     let mut did_modify_scale = false;
     let mut did_modify_location = false;
+    let mut did_modify_rotation = false;
     for prop in exp2.get_normal_export_mut().unwrap().properties.iter_mut() {
         if let Property::StructProperty(prop) = prop {
             if prop.name.get_owned_content() == "RelativeLocation" {
@@ -164,10 +156,22 @@ fn add_box(asset: &mut Asset<std::io::BufReader<File>>, pos: DVec3, scale: DVec3
                     }
                 }
             }
+            if prop.name.get_owned_content() == "RelativeRotation" {
+                for prop in &mut prop.value {
+                    if let Property::RotatorProperty(prop) = prop {
+                        assert!(!did_modify_rotation);
+                        prop.value.x.0 = euler.y;
+                        prop.value.y.0 = euler.x;
+                        prop.value.z.0 = euler.z;
+                        did_modify_rotation = true;
+                    }
+                }
+            }
         }
     }
     assert!(did_modify_scale);
     assert!(did_modify_location);
+    assert!(did_modify_rotation);
 
     let level_export = asset.get_export_mut(PackageIndex::new(1)).unwrap();
     level_export
@@ -181,6 +185,9 @@ fn add_box(asset: &mut Asset<std::io::BufReader<File>>, pos: DVec3, scale: DVec3
 
 fn vec3(p: shalrath::repr::Point) -> Vec3 {
     Vec3::new(p.x, p.y, p.z)
+}
+fn dvec3(v: Vec3) -> DVec3 {
+    DVec3::new(v.x as f64, v.y as f64, v.z as f64)
 }
 fn calculate_normal(plane: shalrath::repr::TrianglePlane) -> Vec3 {
     let p0 = vec3(plane.v0);
@@ -211,11 +218,11 @@ fn is_box(brush: &shalrath::repr::Brush) -> bool {
         let mut angle180 = 0;
         for b in &normals {
             let angle = angle_between(a, b).abs();
-            if angle == 0.0 {
+            if approx_eq(angle, 0.0, 1e-2) {
                 angle0 += 1;
-            } else if approx_eq(angle, 0.5*PI, 1e-5) {
+            } else if approx_eq(angle, 0.5*PI, 1e-2) {
                 angle90 += 1;
-            } else if approx_eq(angle, PI, 1e-5) {
+            } else if approx_eq(angle, PI, 1e-2) {
                 angle180 += 1;
             }
         }
@@ -269,7 +276,7 @@ fn derive_rotation(brush: &shalrath::repr::Brush) -> Vec3 {
             if is_in_positive_quadrant(n) {
                 pos_quadrant_normal_found = true;
                 
-                *dst = dbg!(angle_between(n, ref_axis));
+                *dst = angle_between(n, ref_axis);
             }
         }
         assert!(pos_quadrant_normal_found);
@@ -277,7 +284,7 @@ fn derive_rotation(brush: &shalrath::repr::Brush) -> Vec3 {
     }
     // need to rotate on all 3 axes
     panic!("can't handle 3-axis euler rotations right now :(. please stick to single axis rotated boxes.");
-    Vec3::new(0.0, 0.0, 0.0)
+    //Vec3::new(0.0, 0.0, 0.0)
 }
 fn is_in_positive_quadrant(v: &Vec3) -> bool {
     v.x >= 0.0 && v.y >= 0.0 && v.z >= 0.0

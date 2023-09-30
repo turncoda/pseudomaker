@@ -1,5 +1,5 @@
 [package]
-name = "tb2umap"
+name = "pseudo-maker"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,4 +8,4 @@ edition = "2021"
 [dependencies]
 shalrath = "0.2.5"
 glam = "0.23"
-unreal_asset = { git = "https://github.com/astrotechies/unrealmodding", rev = "40bc421" }
+unreal_asset = { git = "https://github.com/astrotechies/unrealmodding", rev = "84e60cc" }
