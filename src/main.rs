@@ -1,4 +1,5 @@
-use glam::{Vec3, DVec3};
+use itertools::Itertools;
+use glam::{Vec3, DVec3, DQuat, Mat3};
 use shalrath::parser::repr::parse_map;
 use std::fs::File;
 use unreal_asset::{
@@ -9,11 +10,13 @@ use unreal_asset::{
     Asset,
 };
 
+// make this a command line arg or world settings param
 const GLOBAL_SCALE: f64 = 4.0;
 const PI: f32 = std::f32::consts::PI;
-const UNIT_X: Vec3 = Vec3::new(1.0, 0.0, 0.0);
-const UNIT_Y: Vec3 = Vec3::new(0.0, 1.0, 0.0);
-const UNIT_Z: Vec3 = Vec3::new(0.0, 0.0, 1.0);
+const PI64: f64 = std::f64::consts::PI;
+const UNIT_X: DVec3 = DVec3::new(1.0, 0.0, 0.0);
+const UNIT_Y: DVec3 = DVec3::new(0.0, 1.0, 0.0);
+const UNIT_Z: DVec3 = DVec3::new(0.0, 0.0, 1.0);
 
 #[derive(Debug)]
 struct UBox {
@@ -46,16 +49,21 @@ fn main() {
     let mut uboxes = vec![];
     for entity in map_ast.0 {
         for brush in entity.brushes.0 {
-            let mut centroid = DVec3::new(0.0, 0.0, 0.0);
+            // TrenchBroom uses a right-handed coordinate system with +z facing up.
+            // Unreal uses a left-handed coordinate system with +z facing up.
+            // So, we mirror across the xz-plane when converting.
+            let brush = mirror_xz(&brush);
+            let vertices = calculate_vertices(&brush);
+            let centroid = dvec3(avg(&vertices));
+            let rot = derive_rotation(&brush);
             let mut min = DVec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
             let mut max = DVec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-            for brush_plane in &brush.0 {
-                let x = brush_plane.plane.v0.x as f64;
-                let y = -brush_plane.plane.v0.y as f64;
-                let z = brush_plane.plane.v0.z as f64;
-                centroid.x += x;
-                centroid.y += y;
-                centroid.z += z;
+            for p in vertices {
+                let p = dvec3(p);
+                let rp = rot.inverse() * (p - centroid);
+                let x = rp.x as f64;
+                let y = rp.y as f64;
+                let z = rp.z as f64;
                 min.x = f64::min(x, min.x);
                 min.y = f64::min(y, min.y);
                 min.z = f64::min(z, min.z);
@@ -63,8 +71,10 @@ fn main() {
                 max.y = f64::max(y, max.y);
                 max.z = f64::max(z, max.z);
             }
-            let euler = derive_rotation(&brush) / PI * 180.0;
-            uboxes.push(UBox::new(centroid / 6.0, max - min, DVec3::new(0.0, 0.0, 0.0)));
+            let (z, y, x) = rot.to_euler(glam::EulerRot::ZYX);
+            let mut euler = DVec3::new(-y, z, -x);
+            euler = euler / PI64 * 180.0;
+            uboxes.push(UBox::new(centroid, max - min, euler));
         }
     }
 
@@ -72,10 +82,10 @@ fn main() {
 }
 
 fn main2(uboxes: Vec<UBox>, output_path: &str) {
-    let data_file = std::io::BufReader::new(File::open("empty_level.umap").unwrap());
-    let bulk_file = std::io::BufReader::new(File::open("empty_level.uexp").unwrap());
+    let asset_data = std::io::Cursor::new(&include_bytes!("empty_level.umap")[..]);
+    let bulk_data = std::io::Cursor::new(&include_bytes!("empty_level.uexp")[..]);
 
-    let mut asset = Asset::new(data_file, Some(bulk_file), EngineVersion::VER_UE5_1, None).unwrap();
+    let mut asset = Asset::new(asset_data, Some(bulk_data), EngineVersion::VER_UE5_1, None).unwrap();
 
     for ubox in uboxes {
         add_box(&mut asset, ubox.position, ubox.scale, ubox.euler);
@@ -83,6 +93,7 @@ fn main2(uboxes: Vec<UBox>, output_path: &str) {
 
     {
         let new_main_export_name = asset.add_fname("Slot1");
+        // TODO don't hardcode these export indices
         let main_export = asset.get_export_mut(PackageIndex::new(6)).unwrap();
         assert_eq!(
             main_export
@@ -98,7 +109,6 @@ fn main2(uboxes: Vec<UBox>, output_path: &str) {
         for actor in &mut level_export.actors {
             if actor.index == 4 {
                 actor.index = 0;
-                println!("Removed original StaticMeshActor from PersistentLevel");
             }
         }
     } else {
@@ -110,7 +120,8 @@ fn main2(uboxes: Vec<UBox>, output_path: &str) {
     let _ = asset.write_data(&mut out_uasset, Some(&mut out_uexp));
 }
 
-fn add_box(asset: &mut Asset<std::io::BufReader<File>>, pos: DVec3, scale: DVec3, euler: DVec3) {
+fn add_box(asset: &mut Asset<std::io::Cursor<&[u8]>>, pos: DVec3, scale: DVec3, euler: DVec3) {
+    // TODO don't hardcode these export indices
     let mut exp1 = asset.get_export(PackageIndex::new(4)).unwrap().clone();
     let exp2 = asset.get_export(PackageIndex::new(5)).unwrap().clone();
     asset.asset_data.exports.push(exp2);
@@ -160,8 +171,8 @@ fn add_box(asset: &mut Asset<std::io::BufReader<File>>, pos: DVec3, scale: DVec3
                 for prop in &mut prop.value {
                     if let Property::RotatorProperty(prop) = prop {
                         assert!(!did_modify_rotation);
-                        prop.value.x.0 = euler.y;
-                        prop.value.y.0 = euler.x;
+                        prop.value.x.0 = euler.x;
+                        prop.value.y.0 = euler.y;
                         prop.value.z.0 = euler.z;
                         did_modify_rotation = true;
                     }
@@ -232,7 +243,57 @@ fn is_box(brush: &shalrath::repr::Brush) -> bool {
     }
     true
 }
-fn derive_rotation(brush: &shalrath::repr::Brush) -> Vec3 {
+fn avg(pts: &[Vec3]) -> Vec3 {
+    let sum = pts.iter().fold(Vec3::new(0.0, 0.0, 0.0), |a, b| a + *b);
+    sum / pts.len() as f32
+}
+fn calculate_vertices(brush: &shalrath::repr::Brush) -> Vec<Vec3> {
+    let mut plane_intersections = vec![];
+    let planes_and_normals: Vec<_> = brush.0.iter().map(|plane| (plane.plane, calculate_normal(plane.plane))).collect();
+    for c in planes_and_normals.iter().combinations(3) {
+        let (p0, n0) = c[0];
+        let (p1, n1) = c[1];
+        let (p2, n2) = c[2];
+        let a0 = angle_between(n0, n1).abs();
+        let a1 = angle_between(n1, n2).abs();
+        let a2 = angle_between(n2, n0).abs();
+        let b0 = approx_eq(a0, 0.5*PI, 1e-2);
+        let b1 = approx_eq(a1, 0.5*PI, 1e-2);
+        let b2 = approx_eq(a2, 0.5*PI, 1e-2);
+        if b0 && b1 && b2 {
+            let x0 = vec3(p0.v0);
+            let x1 = vec3(p1.v0);
+            let x2 = vec3(p2.v0);
+            let u0 = n0.normalize();
+            let u1 = n1.normalize();
+            let u2 = n2.normalize();
+            let det = Mat3::from_cols(u0, u1, u2).determinant();
+            let c0 = x0.dot(u0) * u1.cross(u2);
+            let c1 = x1.dot(u1) * u2.cross(u0);
+            let c2 = x2.dot(u2) * u0.cross(u1);
+            let intersection = det.powi(-1) * (c0 + c1 + c2);
+            plane_intersections.push(intersection);
+        }
+    }
+    assert_eq!(8, plane_intersections.len());
+    plane_intersections
+}
+fn point(v: DVec3) -> shalrath::repr::Point {
+    shalrath::repr::Point{x: v.x as f32, y: v.y as f32, z: v.z as f32}
+}
+fn rotate_brush(brush: &shalrath::repr::Brush, rot: DQuat) -> shalrath::repr::Brush {
+    let centroid = avg(&calculate_vertices(&brush));
+    let mut planes = vec![];
+    for plane in &brush.0 {
+        let mut plane = plane.clone();
+        plane.plane.v0 = point(rot * dvec3(vec3(plane.plane.v0) - centroid) + dvec3(centroid));
+        plane.plane.v1 = point(rot * dvec3(vec3(plane.plane.v1) - centroid) + dvec3(centroid));
+        plane.plane.v2 = point(rot * dvec3(vec3(plane.plane.v2) - centroid) + dvec3(centroid));
+        planes.push(plane);
+    }
+    shalrath::repr::Brush(planes)
+}
+fn derive_rotation(brush: &shalrath::repr::Brush) -> DQuat {
     assert!(is_box(brush));
     let normals: Vec<Vec3> = brush.0.iter().map(|plane| calculate_normal(plane.plane)).collect();
     let mut is_aligned_x = false;
@@ -254,38 +315,65 @@ fn derive_rotation(brush: &shalrath::repr::Brush) -> Vec3 {
         }
     }
     if is_aligned_x && is_aligned_y && is_aligned_z {
-        return Vec3::new(0.0, 0.0, 0.0);
+        return DQuat::IDENTITY;
     }
-    if is_aligned_x || is_aligned_y || is_aligned_z {
-        let mut result = Vec3::new(0.0, 0.0, 0.0);
-        let (ref_axis, dst) = if is_aligned_x {
-            println!("x aligned");
-            (&UNIT_Z, &mut result.x)
-        } else if is_aligned_y {
-            println!("y aligned");
-            (&UNIT_X, &mut result.y)
+    let unaligned_normals: Vec<_> = normals.iter().enumerate().filter_map(|(i, n)| {
+        if is_aligned_normal[i] {
+            None
         } else {
-            println!("z aligned");
-            (&UNIT_Y, &mut result.z)
-        };
-        let mut pos_quadrant_normal_found = false;
-        for (i, n) in normals.iter().enumerate() {
-            if is_aligned_normal[i] {
-                continue;
-            }
-            if is_in_positive_quadrant(n) {
-                pos_quadrant_normal_found = true;
-                
-                *dst = angle_between(n, ref_axis);
-            }
+            Some(n.clone())
         }
-        assert!(pos_quadrant_normal_found);
-        return result;
+    }).collect();
+    if unaligned_normals.len() == 4 {
+        let pqn = find_pos_quadrant_normal(&unaligned_normals).unwrap().normalize();
+        // using right-handed coordinate system
+        if is_aligned_x {
+            return DQuat::from_rotation_arc(UNIT_Y, dvec3(pqn));
+        }
+        if is_aligned_y {
+            return DQuat::from_rotation_arc(UNIT_Z, dvec3(pqn));
+        }
+        if is_aligned_z {
+            return DQuat::from_rotation_arc(UNIT_X, dvec3(pqn));
+        }
+        panic!("unreachable");
     }
-    // need to rotate on all 3 axes
-    panic!("can't handle 3-axis euler rotations right now :(. please stick to single axis rotated boxes.");
-    //Vec3::new(0.0, 0.0, 0.0)
+    panic!("can't handle multi-axis rotations right now. sorry :/");
+    let phn = find_pos_hemisphere_normal(&unaligned_normals).unwrap().normalize();
+    let z_aligning_rotation = DQuat::from_rotation_arc(UNIT_Z, dvec3(phn));
+    z_aligning_rotation + derive_rotation(&rotate_brush(&brush, z_aligning_rotation.inverse()))
+}
+fn find_pos_hemisphere_normal(normals: &[Vec3]) -> Option<Vec3> {
+    for n in normals {
+        if n.z >= 0.0 {
+            return Some(n.clone());
+        }
+    }
+    None
+}
+fn find_pos_quadrant_normal(normals: &[Vec3]) -> Option<Vec3> {
+    for n in normals {
+        if is_in_positive_quadrant(n) {
+            return Some(n.clone());
+        }
+    }
+    None
 }
 fn is_in_positive_quadrant(v: &Vec3) -> bool {
-    v.x >= 0.0 && v.y >= 0.0 && v.z >= 0.0
+    let epsilon = 1e-3;
+    v.x >= -epsilon && v.y >= -epsilon && v.z >= -epsilon
+}
+fn flip_y(point: &mut shalrath::repr::Point) {
+    point.y = -point.y;
+}
+fn mirror_xz(brush: &shalrath::repr::Brush) -> shalrath::repr::Brush {
+    let mut planes = vec![];
+    for plane in &brush.0 {
+        let mut mirrored = plane.clone();
+        flip_y(&mut mirrored.plane.v0);
+        flip_y(&mut mirrored.plane.v1);
+        flip_y(&mut mirrored.plane.v2);
+        planes.push(mirrored);
+    }
+    shalrath::repr::Brush::new(planes)
 }

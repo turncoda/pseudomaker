@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+itertools = "0.11.0"
 shalrath = "0.2.5"
 glam = "0.23"
 unreal_asset = { git = "https://github.com/astrotechies/unrealmodding", rev = "84e60cc" }
