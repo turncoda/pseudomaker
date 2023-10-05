@@ -69,6 +69,7 @@ fn main() {
         .path
         .strip_prefix("/Game/")
         .expect("Please pass in a path starting with \"/Game/\".");
+    let export_name = args.path.split("/").last().unwrap();
     let map_string = std::fs::read_to_string(args.map).expect("Failed to read map file.");
     let (_, map_ast) = parse_map(&map_string).expect("Failed to parse map.");
     let mut uboxes = vec![];
@@ -122,7 +123,7 @@ fn main() {
     }
 
     {
-        let new_main_export_name = asset.add_fname("Slot1");
+        let new_main_export_name = asset.add_fname(&export_name);
         // TODO don't hardcode these export indices
         let main_export = asset.get_export_mut(PackageIndex::new(6)).unwrap();
         assert_eq!(
