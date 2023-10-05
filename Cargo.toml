@@ -11,3 +11,5 @@ itertools = "0.11.0"
 shalrath = "0.2.5"
 glam = "0.23"
 unreal_asset = { git = "https://github.com/astrotechies/unrealmodding", rev = "84e60cc" }
+repak = { git = "https://github.com/trumank/repak.git", rev = "6bd3be3" }
+clap = { version = "4.4.6", features = ["derive"] }

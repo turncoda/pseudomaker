@@ -1,7 +1,9 @@
+use clap::Parser;
+use glam::{DQuat, DVec3, Mat3, Vec3};
 use itertools::Itertools;
-use glam::{Vec3, DVec3, DQuat, Mat3};
 use shalrath::parser::repr::parse_map;
 use std::fs::File;
+use std::io::Cursor;
 use unreal_asset::{
     base::types::PackageIndex,
     engine_version::EngineVersion,
@@ -10,6 +12,27 @@ use unreal_asset::{
     Asset,
 };
 
+/// Convert simple Quake maps into Pseudoregalia levels.
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to Quake map file.
+    #[arg(short, long)]
+    map: String,
+
+    /// Asset path in pak. (Example: "/Game/Maps/MyMap")
+    #[arg(short, long)]
+    path: String,
+
+    /// Path of output pak file.
+    #[arg(short, long)]
+    out: String,
+
+    /// Scale of level.
+    #[arg(short, long, default_value_t = 1.0)]
+    scale: f64,
+}
+
 // make this a command line arg or world settings param
 const GLOBAL_SCALE: f64 = 4.0;
 const PI: f32 = std::f32::consts::PI;
@@ -17,6 +40,11 @@ const PI64: f64 = std::f64::consts::PI;
 const UNIT_X: DVec3 = DVec3::new(1.0, 0.0, 0.0);
 const UNIT_Y: DVec3 = DVec3::new(0.0, 1.0, 0.0);
 const UNIT_Z: DVec3 = DVec3::new(0.0, 0.0, 1.0);
+const U1_CUBE_UASSET: &[u8] = include_bytes!("u1_cube.uasset");
+const U1_CUBE_UBULK: &[u8] = include_bytes!("u1_cube.ubulk");
+const U1_CUBE_UEXP: &[u8] = include_bytes!("u1_cube.uexp");
+const EMPTY_LEVEL_UMAP: &[u8] = include_bytes!("empty_level.umap");
+const EMPTY_LEVEL_UEXP: &[u8] = include_bytes!("empty_level.uexp");
 
 #[derive(Debug)]
 struct UBox {
@@ -36,15 +64,12 @@ impl UBox {
 }
 
 fn main() {
-    let mut args = std::env::args();
-    _ = args.next();
-    let input_path = args
-        .next()
-        .expect("Please specify map file as first argument.");
-    let output_path = args
-        .next()
-        .expect("Please specify output directory as second argument.");
-    let map_string = std::fs::read_to_string(input_path).expect("Failed to read map file.");
+    let args = Args::parse();
+    let relative_path = args
+        .path
+        .strip_prefix("/Game/")
+        .expect("Please pass in a path starting with \"/Game/\".");
+    let map_string = std::fs::read_to_string(args.map).expect("Failed to read map file.");
     let (_, map_ast) = parse_map(&map_string).expect("Failed to parse map.");
     let mut uboxes = vec![];
     for entity in map_ast.0 {
@@ -78,17 +103,22 @@ fn main() {
         }
     }
 
-    main2(uboxes, &output_path);
-}
-
-fn main2(uboxes: Vec<UBox>, output_path: &str) {
-    let asset_data = std::io::Cursor::new(&include_bytes!("empty_level.umap")[..]);
-    let bulk_data = std::io::Cursor::new(&include_bytes!("empty_level.uexp")[..]);
-
-    let mut asset = Asset::new(asset_data, Some(bulk_data), EngineVersion::VER_UE5_1, None).unwrap();
+    let mut asset = Asset::new(
+        Cursor::new(EMPTY_LEVEL_UMAP),
+        Some(Cursor::new(EMPTY_LEVEL_UEXP)),
+        EngineVersion::VER_UE5_1,
+        None,
+    )
+    .unwrap();
 
     for ubox in uboxes {
-        add_box(&mut asset, ubox.position, ubox.scale, ubox.euler);
+        add_box(
+            &mut asset,
+            ubox.position,
+            ubox.scale,
+            ubox.euler,
+            args.scale,
+        );
     }
 
     {
@@ -115,12 +145,39 @@ fn main2(uboxes: Vec<UBox>, output_path: &str) {
         panic!("PersistentLevel not found");
     }
 
-    let mut out_uasset = File::create(format!("{}/Slot1.umap", output_path)).unwrap();
-    let mut out_uexp = File::create(format!("{}/Slot1.uexp", output_path)).unwrap();
-    let _ = asset.write_data(&mut out_uasset, Some(&mut out_uexp));
+    let mut umap_data = vec![];
+    let mut uexp_data = vec![];
+    let _ = asset.write_data(
+        &mut Cursor::new(&mut umap_data),
+        Some(&mut Cursor::new(&mut uexp_data)),
+    );
+
+    let mut pak = repak::PakWriter::new(
+        File::create(args.out).unwrap(),
+        repak::Version::V11,
+        "../../../pseudoregalia/Content/".to_string(),
+        None,
+    );
+    pak.write_file("Mods/PseudoMaker/u1_cube.uasset", U1_CUBE_UASSET)
+        .unwrap();
+    pak.write_file("Mods/PseudoMaker/u1_cube.ubulk", U1_CUBE_UBULK)
+        .unwrap();
+    pak.write_file("Mods/PseudoMaker/u1_cube.uexp", U1_CUBE_UEXP)
+        .unwrap();
+    pak.write_file(&format!("{}.umap", relative_path), &umap_data)
+        .unwrap();
+    pak.write_file(&format!("{}.uexp", relative_path), &uexp_data)
+        .unwrap();
+    pak.write_index().unwrap();
 }
 
-fn add_box(asset: &mut Asset<std::io::Cursor<&[u8]>>, pos: DVec3, scale: DVec3, euler: DVec3) {
+fn add_box(
+    asset: &mut Asset<std::io::Cursor<&[u8]>>,
+    pos: DVec3,
+    scale: DVec3,
+    euler: DVec3,
+    scale_arg: f64,
+) {
     // TODO don't hardcode these export indices
     let mut exp1 = asset.get_export(PackageIndex::new(4)).unwrap().clone();
     let exp2 = asset.get_export(PackageIndex::new(5)).unwrap().clone();
@@ -149,9 +206,9 @@ fn add_box(asset: &mut Asset<std::io::Cursor<&[u8]>>, pos: DVec3, scale: DVec3, 
                 for prop in &mut prop.value {
                     if let Property::VectorProperty(prop) = prop {
                         assert!(!did_modify_location);
-                        prop.value.x.0 = GLOBAL_SCALE * pos.x;
-                        prop.value.y.0 = GLOBAL_SCALE * pos.y;
-                        prop.value.z.0 = GLOBAL_SCALE * pos.z;
+                        prop.value.x.0 = scale_arg * GLOBAL_SCALE * pos.x;
+                        prop.value.y.0 = scale_arg * GLOBAL_SCALE * pos.y;
+                        prop.value.z.0 = scale_arg * GLOBAL_SCALE * pos.z;
                         did_modify_location = true;
                     }
                 }
@@ -160,9 +217,9 @@ fn add_box(asset: &mut Asset<std::io::Cursor<&[u8]>>, pos: DVec3, scale: DVec3, 
                 for prop in &mut prop.value {
                     if let Property::VectorProperty(prop) = prop {
                         assert!(!did_modify_scale);
-                        prop.value.x.0 = GLOBAL_SCALE * scale.x;
-                        prop.value.y.0 = GLOBAL_SCALE * scale.y;
-                        prop.value.z.0 = GLOBAL_SCALE * scale.z;
+                        prop.value.x.0 = scale_arg * GLOBAL_SCALE * scale.x;
+                        prop.value.y.0 = scale_arg * GLOBAL_SCALE * scale.y;
+                        prop.value.z.0 = scale_arg * GLOBAL_SCALE * scale.z;
                         did_modify_scale = true;
                     }
                 }
@@ -221,7 +278,11 @@ fn is_box(brush: &shalrath::repr::Brush) -> bool {
     if brush.0.len() != 6 {
         return false;
     }
-    let normals: Vec<Vec3> = brush.0.iter().map(|plane| calculate_normal(plane.plane)).collect();
+    let normals: Vec<Vec3> = brush
+        .0
+        .iter()
+        .map(|plane| calculate_normal(plane.plane))
+        .collect();
     // TODO this could be more efficient
     for a in &normals {
         let mut angle0 = 0;
@@ -231,7 +292,7 @@ fn is_box(brush: &shalrath::repr::Brush) -> bool {
             let angle = angle_between(a, b).abs();
             if approx_eq(angle, 0.0, 1e-2) {
                 angle0 += 1;
-            } else if approx_eq(angle, 0.5*PI, 1e-2) {
+            } else if approx_eq(angle, 0.5 * PI, 1e-2) {
                 angle90 += 1;
             } else if approx_eq(angle, PI, 1e-2) {
                 angle180 += 1;
@@ -249,7 +310,11 @@ fn avg(pts: &[Vec3]) -> Vec3 {
 }
 fn calculate_vertices(brush: &shalrath::repr::Brush) -> Vec<Vec3> {
     let mut plane_intersections = vec![];
-    let planes_and_normals: Vec<_> = brush.0.iter().map(|plane| (plane.plane, calculate_normal(plane.plane))).collect();
+    let planes_and_normals: Vec<_> = brush
+        .0
+        .iter()
+        .map(|plane| (plane.plane, calculate_normal(plane.plane)))
+        .collect();
     for c in planes_and_normals.iter().combinations(3) {
         let (p0, n0) = c[0];
         let (p1, n1) = c[1];
@@ -257,9 +322,9 @@ fn calculate_vertices(brush: &shalrath::repr::Brush) -> Vec<Vec3> {
         let a0 = angle_between(n0, n1).abs();
         let a1 = angle_between(n1, n2).abs();
         let a2 = angle_between(n2, n0).abs();
-        let b0 = approx_eq(a0, 0.5*PI, 1e-2);
-        let b1 = approx_eq(a1, 0.5*PI, 1e-2);
-        let b2 = approx_eq(a2, 0.5*PI, 1e-2);
+        let b0 = approx_eq(a0, 0.5 * PI, 1e-2);
+        let b1 = approx_eq(a1, 0.5 * PI, 1e-2);
+        let b2 = approx_eq(a2, 0.5 * PI, 1e-2);
         if b0 && b1 && b2 {
             let x0 = vec3(p0.v0);
             let x1 = vec3(p1.v0);
@@ -279,7 +344,11 @@ fn calculate_vertices(brush: &shalrath::repr::Brush) -> Vec<Vec3> {
     plane_intersections
 }
 fn point(v: DVec3) -> shalrath::repr::Point {
-    shalrath::repr::Point{x: v.x as f32, y: v.y as f32, z: v.z as f32}
+    shalrath::repr::Point {
+        x: v.x as f32,
+        y: v.y as f32,
+        z: v.z as f32,
+    }
 }
 fn rotate_brush(brush: &shalrath::repr::Brush, rot: DQuat) -> shalrath::repr::Brush {
     let centroid = avg(&calculate_vertices(&brush));
@@ -295,7 +364,11 @@ fn rotate_brush(brush: &shalrath::repr::Brush, rot: DQuat) -> shalrath::repr::Br
 }
 fn derive_rotation(brush: &shalrath::repr::Brush) -> DQuat {
     assert!(is_box(brush));
-    let normals: Vec<Vec3> = brush.0.iter().map(|plane| calculate_normal(plane.plane)).collect();
+    let normals: Vec<Vec3> = brush
+        .0
+        .iter()
+        .map(|plane| calculate_normal(plane.plane))
+        .collect();
     let mut is_aligned_x = false;
     let mut is_aligned_y = false;
     let mut is_aligned_z = false;
@@ -317,15 +390,21 @@ fn derive_rotation(brush: &shalrath::repr::Brush) -> DQuat {
     if is_aligned_x && is_aligned_y && is_aligned_z {
         return DQuat::IDENTITY;
     }
-    let unaligned_normals: Vec<_> = normals.iter().enumerate().filter_map(|(i, n)| {
-        if is_aligned_normal[i] {
-            None
-        } else {
-            Some(n.clone())
-        }
-    }).collect();
+    let unaligned_normals: Vec<_> = normals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| {
+            if is_aligned_normal[i] {
+                None
+            } else {
+                Some(n.clone())
+            }
+        })
+        .collect();
     if unaligned_normals.len() == 4 {
-        let pqn = find_pos_quadrant_normal(&unaligned_normals).unwrap().normalize();
+        let pqn = find_pos_quadrant_normal(&unaligned_normals)
+            .unwrap()
+            .normalize();
         // using right-handed coordinate system
         if is_aligned_x {
             return DQuat::from_rotation_arc(UNIT_Y, dvec3(pqn));
@@ -339,7 +418,9 @@ fn derive_rotation(brush: &shalrath::repr::Brush) -> DQuat {
         panic!("unreachable");
     }
     panic!("can't handle multi-axis rotations right now. sorry :/");
-    let phn = find_pos_hemisphere_normal(&unaligned_normals).unwrap().normalize();
+    let phn = find_pos_hemisphere_normal(&unaligned_normals)
+        .unwrap()
+        .normalize();
     let z_aligning_rotation = DQuat::from_rotation_arc(UNIT_Z, dvec3(phn));
     z_aligning_rotation + derive_rotation(&rotate_brush(&brush, z_aligning_rotation.inverse()))
 }
