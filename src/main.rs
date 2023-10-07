@@ -4,6 +4,7 @@ use itertools::Itertools;
 use shalrath::parser::repr::parse_map;
 use std::fs::File;
 use std::io::Cursor;
+use std::collections::HashMap;
 use unreal_asset::{
     base::types::PackageIndex,
     engine_version::EngineVersion,
@@ -70,13 +71,14 @@ fn main() {
         .strip_prefix("/Game/")
         .expect("Please pass in a path starting with \"/Game/\".");
     let export_name = args.path.split("/").last().unwrap();
+
     let map_string = std::fs::read_to_string(args.map).expect("Failed to read map file.");
     let (_, map_ast) = parse_map(&map_string).expect("Failed to parse map.");
     let mut uboxes = vec![];
     for entity in map_ast.0 {
         for brush in entity.brushes.0 {
-            // TrenchBroom uses a right-handed coordinate system with +z facing up.
-            // Unreal uses a left-handed coordinate system with +z facing up.
+            // TrenchBroom uses a right-handed coordinate system with +z pointing up.
+            // Unreal uses a left-handed coordinate system with +z pointing up.
             // So, we mirror across the xz-plane when converting.
             let brush = mirror_xz(&brush);
             let vertices = calculate_vertices(&brush);
@@ -112,9 +114,26 @@ fn main() {
     )
     .unwrap();
 
+    let export_map = make_export_map(&asset);
+    // Contains list of all actors.
+    assert!(export_map.contains_key("PersistentLevel"));
+    // Actor for u1_cube static mesh.
+    assert!(export_map.contains_key("StaticMeshActor"));
+    // Child export of StaticMeshActor.
+    // Contains transform information for u1_cube static mesh.
+    assert!(export_map.contains_key("StaticMeshComponent0"));
+    // Main export. Name must match final part of umap path in pak.
+    assert!(export_map.contains_key("empty_level"));
+
+    println!("PersistentLevel: {}", export_map.get("PersistentLevel").unwrap().index);
+    println!("StaticMeshActor: {}", export_map.get("StaticMeshActor").unwrap().index);
+    println!("StaticMeshComponent0: {}", export_map.get("StaticMeshComponent0").unwrap().index);
+    println!("empty_level: {}", export_map.get("empty_level").unwrap().index);
+
     for ubox in uboxes {
         add_box(
             &mut asset,
+            &export_map,
             ubox.position,
             ubox.scale,
             ubox.euler,
@@ -124,21 +143,13 @@ fn main() {
 
     {
         let new_main_export_name = asset.add_fname(&export_name);
-        // TODO don't hardcode these export indices
-        let main_export = asset.get_export_mut(PackageIndex::new(6)).unwrap();
-        assert_eq!(
-            main_export
-                .get_base_export_mut()
-                .object_name
-                .get_owned_content(),
-            "empty_level"
-        );
+        let main_export = asset.get_export_mut(export_map.get("empty_level").unwrap().clone()).unwrap();
         main_export.get_base_export_mut().object_name = new_main_export_name;
     }
 
-    if let Export::LevelExport(level_export) = asset.get_export_mut(PackageIndex::new(1)).unwrap() {
+    if let Export::LevelExport(level_export) = asset.get_export_mut(export_map.get("PersistentLevel").unwrap().clone()).unwrap() {
         for actor in &mut level_export.actors {
-            if actor.index == 4 {
+            if actor.index == export_map.get("StaticMeshActor").unwrap().index {
                 actor.index = 0;
             }
         }
@@ -172,20 +183,29 @@ fn main() {
     pak.write_index().unwrap();
 }
 
+fn make_export_map(asset: &Asset<std::io::Cursor<&[u8]>>) -> HashMap<String, PackageIndex> {
+    let mut result = HashMap::new();
+    for (i, export) in asset.asset_data.exports.iter().enumerate() {
+        result.insert(export.get_base_export().object_name.get_owned_content(),
+        PackageIndex::new((i+1) as i32));
+    }
+    result
+}
+
 fn add_box(
     asset: &mut Asset<std::io::Cursor<&[u8]>>,
+    export_map: &HashMap<String, PackageIndex>,
     pos: DVec3,
     scale: DVec3,
     euler: DVec3,
     scale_arg: f64,
 ) {
-    // TODO don't hardcode these export indices
-    let mut exp1 = asset.get_export(PackageIndex::new(4)).unwrap().clone();
-    let exp2 = asset.get_export(PackageIndex::new(5)).unwrap().clone();
+    let mut exp1 = asset.get_export(export_map.get("StaticMeshActor").unwrap().clone()).unwrap().clone();
+    let exp2 = asset.get_export(export_map.get("StaticMeshComponent0").unwrap().clone()).unwrap().clone();
     asset.asset_data.exports.push(exp2);
     let idx2 = PackageIndex::new(asset.asset_data.exports.len() as i32);
     exp1.get_base_export_mut().object_name =
-        asset.add_fname(&format!("StaticMeshActor_{}", idx2.index + 1));
+        asset.add_fname(&format!("StaticMeshActor_Clone_{}", idx2.index + 1));
     exp1.get_base_export_mut()
         .create_before_serialization_dependencies[0] = idx2;
     for prop in exp1.get_normal_export_mut().unwrap().properties.iter_mut() {
@@ -242,13 +262,16 @@ fn add_box(
     assert!(did_modify_location);
     assert!(did_modify_rotation);
 
-    let level_export = asset.get_export_mut(PackageIndex::new(1)).unwrap();
+    let persistent_level_index = export_map.get("PersistentLevel").unwrap().clone();
+    let level_export = asset.get_export_mut(persistent_level_index).unwrap();
     level_export
         .get_base_export_mut()
         .create_before_serialization_dependencies
         .push(idx1);
     if let Export::LevelExport(level_export) = level_export {
         level_export.actors.push(idx1);
+    } else {
+        panic!("Export is not of type LevelExport");
     }
 }
 
